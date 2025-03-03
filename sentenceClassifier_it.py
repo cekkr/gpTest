@@ -1,14 +1,43 @@
 import spacy
 import re
+import torch
+from transformers import pipeline, AutoModelForSequenceClassification, AutoTokenizer
+import nltk
+from nltk.corpus import wordnet as wn
+
+# Configurazione globale per la scelta del dispositivo di accelerazione
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "mps" if torch.mps.is_available() else DEVICE
+print(f"Utilizzando dispositivo: {DEVICE}")
 
 class AnalizzatoreFrase:
     def __init__(self):
+        # Verifica e download delle risorse NLTK necessarie
+        try:
+            nltk.data.find('corpora/wordnet')
+        except LookupError:
+            print("Scaricamento di WordNet...")
+            nltk.download('wordnet')
+            nltk.download('omw-1.4')  # Open Multilingual WordNet
+
         # Caricamento del modello italiano di spaCy
         try:
             self.nlp = spacy.load("it_core_news_sm")
         except OSError:
             print("Modello italiano non trovato. Installarlo con: python -m spacy download it_core_news_sm")
             raise
+
+        # Caricamento del modello di classificazione semantica (usando un modello multilingue)
+        try:
+            model_name = "Davlan/distilbert-base-multilingual-cased-ner-hrl"
+            self.ner_model = pipeline("ner", 
+                                      model=model_name, 
+                                      tokenizer=model_name, 
+                                      device=0 if DEVICE == "cuda" else -1)
+        except Exception as e:
+            print(f"Errore nel caricamento del modello di classificazione: {e}")
+            print("Proseguimento senza classificazione semantica avanzata.")
+            self.ner_model = None
 
         # Definizione delle categorie grammaticali in italiano
         self.pos_map = {
@@ -77,6 +106,83 @@ class AnalizzatoreFrase:
             "VerbForm=Part": "participio",
             "VerbForm=Ger": "gerundio"
         }
+        
+        # Mappatura delle entità semantiche
+        self.entity_map = {
+            "PER": "persona",
+            "LOC": "luogo",
+            "ORG": "organizzazione",
+            "MISC": "miscellanea",
+            "O": "altro"
+        }
+        
+        # Categorie semantiche predefinite per alcune parole comuni
+        self.categorie_semantiche = {
+            "gatto": ["animale", "animale domestico", "mammifero", "felino"],
+            "cane": ["animale", "animale domestico", "mammifero", "canide"],
+            "casa": ["edificio", "struttura", "abitazione", "immobile"],
+            "mare": ["corpo d'acqua", "ambiente naturale", "ecosistema"],
+            "automobile": ["veicolo", "mezzo di trasporto", "bene materiale"],
+            "libro": ["oggetto", "pubblicazione", "opera letteraria", "fonte di informazione"]
+            # Altre parole possono essere aggiunte qui
+        }
+
+    def ottieni_sinonimi(self, lemma):
+        """Ottiene sinonimi per un lemma dato usando WordNet"""
+        sinonimi = set()
+        
+        # Prova con WordNet in italiano
+        for synset in wn.synsets(lemma, lang='ita'):
+            for lemma_obj in synset.lemmas(lang='ita'):
+                sinonimi.add(lemma_obj.name())
+                
+        # Se non sono stati trovati sinonimi in italiano, prova in inglese e traduci
+        if not sinonimi and lemma not in ['il', 'lo', 'la', 'i', 'gli', 'le', 'un', 'uno', 'una']:
+            try:
+                # Tentativo di traduzione usando WordNet
+                for synset in wn.synsets(self.nlp(lemma)[0]._.lemma):
+                    for lemma_eng in synset.lemmas():
+                        synsets_it = wn.synsets(lemma_eng.name(), lang='ita')
+                        for syn_it in synsets_it:
+                            for lemma_it in syn_it.lemmas(lang='ita'):
+                                sinonimi.add(lemma_it.name())
+            except:
+                pass
+                
+        return list(sinonimi)
+
+    def categorizza_semanticamente(self, lemma, pos):
+        """Categorizza semanticamente una parola usando WordNet e mappature predefinite"""
+        categorie = []
+        
+        # Usa categorie predefinite se disponibili
+        if lemma.lower() in self.categorie_semantiche:
+            categorie.extend(self.categorie_semantiche[lemma.lower()])
+        
+        # Aggiungi categorie da WordNet
+        if pos in ["NOUN", "PROPN", "VERB", "ADJ"]:
+            try:
+                # Cerco synsets in italiano
+                synsets_it = wn.synsets(lemma, lang='ita')
+                
+                # Se non trovo synsets in italiano, provo in inglese
+                if not synsets_it:
+                    synsets_it = wn.synsets(lemma)
+                
+                for synset in synsets_it[:3]:  # Limita a 3 synset per evitare troppe categorie
+                    # Aggiungi ipernimi (categorie più generali)
+                    for hypernym in synset.hypernyms()[:2]:
+                        if hypernym.lemmas():
+                            try:
+                                nome_categoria = hypernym.lemmas()[0].name().replace('_', ' ')
+                                categorie.append(nome_categoria)
+                            except:
+                                continue
+            except:
+                pass
+        
+        # Rimuovi duplicati e limita il numero di categorie
+        return list(set(categorie))[:5]  # Massimo 5 categorie
 
     def categorizza_gruppi(self, doc):
         """Identifica e categorizza gruppi di parole (sintagmi)"""
@@ -146,6 +252,37 @@ class AnalizzatoreFrase:
         
         return gruppi
 
+    def identifica_entita_semantiche(self, frase):
+        """Identifica entità semantiche nella frase usando il modello NER"""
+        if not self.ner_model:
+            return {}
+            
+        try:
+            # Esecuzione del riconoscimento delle entità
+            entities = self.ner_model(frase)
+            
+            # Organizzazione dei risultati per parola
+            entity_map = {}
+            for entity in entities:
+                word = entity['word']
+                if word.startswith('##'):  # Gestione dei token WordPiece
+                    continue
+                    
+                entity_type = entity['entity']
+                score = entity['score']
+                
+                if word not in entity_map or score > entity_map[word]['score']:
+                    entity_map[word] = {
+                        'tipo': entity_type,
+                        'descrizione': self.entity_map.get(entity_type, "altro"),
+                        'score': score
+                    }
+                    
+            return entity_map
+        except Exception as e:
+            print(f"Errore nell'identificazione delle entità: {e}")
+            return {}
+
     def analizza_frase(self, frase):
         """
         Analizza una frase e restituisce un array di oggetti con proprietà grammaticali per ogni parola.
@@ -161,6 +298,9 @@ class AnalizzatoreFrase:
         
         # Identificazione dei gruppi
         gruppi = self.categorizza_gruppi(doc)
+        
+        # Identificazione delle entità semantiche
+        entita_semantiche = self.identifica_entita_semantiche(frase)
         
         # Creazione dell'array di risultati
         risultato = []
@@ -185,6 +325,21 @@ class AnalizzatoreFrase:
                         "parole": gruppo["parole"]
                     }
                     break
+                    
+            # Ottenimento di sinonimi
+            sinonimi = self.ottieni_sinonimi(token.lemma_)
+            
+            # Categorizzazione semantica
+            categorie = self.categorizza_semanticamente(token.lemma_, token.pos_)
+            
+            # Informazioni sull'entità semantica
+            entita = None
+            if token.text in entita_semantiche:
+                entita = {
+                    "tipo": entita_semantiche[token.text]['tipo'],
+                    "descrizione": entita_semantiche[token.text]['descrizione'],
+                    "confidenza": entita_semantiche[token.text]['score']
+                }
             
             # Creazione della struttura dati per la parola
             parola_info = {
@@ -207,7 +362,12 @@ class AnalizzatoreFrase:
                     "tempo_verbale": tempo_verbale,
                     "modo": token.morph.get("Mood", [""])[0],
                 },
-                "gruppo": gruppo_appartenenza
+                "gruppo": gruppo_appartenenza,
+                "semantica": {
+                    "sinonimi": sinonimi,
+                    "categorie": categorie,
+                    "entita": entita
+                }
             }
             
             # Aggiungi la parola al risultato
@@ -234,7 +394,7 @@ def analizza(frase):
 
 # Esempio di utilizzo
 if __name__ == "__main__":
-    frase_esempio = "Il gatto nero corre velocemente nel giardino fiorito."
+    frase_esempio = "Il gatto nero corre velocemente nel giardino fiorito della vecchia casa."
     risultato = analizza(frase_esempio)
     
     # Stampa del risultato in formato leggibile
@@ -259,3 +419,10 @@ if __name__ == "__main__":
         # Stampare informazioni sul gruppo
         if parola['gruppo']:
             print(f"  Gruppo: tipo {parola['gruppo']['tipo']}, parole: {' '.join(parola['gruppo']['parole'])}")
+            
+        # Stampare informazioni semantiche
+        print(f"  Sinonimi: {', '.join(parola['semantica']['sinonimi']) if parola['semantica']['sinonimi'] else 'nessuno'}")
+        print(f"  Categorie semantiche: {', '.join(parola['semantica']['categorie']) if parola['semantica']['categorie'] else 'nessuna'}")
+        
+        if parola['semantica']['entita']:
+            print(f"  Entità: {parola['semantica']['entita']['descrizione']} ({parola['semantica']['entita']['tipo']}) con confidenza {parola['semantica']['entita']['confidenza']:.2f}")
