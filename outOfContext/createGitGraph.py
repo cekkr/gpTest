@@ -155,6 +155,108 @@ def create_commit_plot(commit_data, days=7):
     return fig
 
 
+def create_commit_mosaic(commit_data, weeks=1):
+    """
+    Crea un grafico a mosaico dei commit in stile GitHub
+    """
+    # Definiamo il periodo da visualizzare
+    end_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    start_date = end_date - timedelta(days=(weeks * 7) - 1)
+
+    # Crea un dataframe con tutte le date nel periodo
+    all_dates = pd.date_range(start=start_date, end=end_date)
+    df = pd.DataFrame({'date': all_dates})
+
+    # Aggiungiamo giorno della settimana (0=lunedì, 6=domenica) e numero della settimana
+    df['weekday'] = df['date'].dt.weekday
+
+    # Calcoliamo il numero della settimana relativo all'inizio del periodo
+    df['week'] = ((df['date'] - start_date).dt.days // 7)
+
+    # Uniamo con i dati dei commit, usando 0 per i giorni senza commit
+    if not commit_data.empty:
+        df = df.merge(commit_data[['date', 'commits']], on='date', how='left')
+    else:
+        df['commits'] = 0
+
+    df['commits'] = df['commits'].fillna(0).astype(int)
+
+    # Prepariamo i dati per il grafico a mosaico
+    pivot_data = df.pivot(index='weekday', columns='week', values='commits').fillna(0)
+
+    # Definiamo i colori in stile GitHub
+    colors = ['#ebedf0', '#9be9a8', '#40c463', '#30a14e', '#216e39']
+
+    # Normalizzazione per la colorazione
+    max_val = df['commits'].max() if df['commits'].max() > 0 else 1
+
+    # Creiamo il grafico a mosaico usando heatmap
+    fig = go.Figure(data=go.Heatmap(
+        z=pivot_data.values,
+        colorscale=[
+            [0, colors[0]],
+            [0.001 if max_val > 1 else 0.25, colors[0]],  # 0 commits
+            [0.001 if max_val > 1 else 0.25, colors[1]],  # 1-25% del max
+            [0.25, colors[1]],
+            [0.25, colors[2]],  # 25-50% del max
+            [0.5, colors[2]],
+            [0.5, colors[3]],  # 50-75% del max
+            [0.75, colors[3]],
+            [0.75, colors[4]],  # 75-100% del max
+            [1.0, colors[4]]
+        ],
+        showscale=False,
+        hovertemplate='Commit: %{z}<extra></extra>'
+    ))
+
+    # Aggiungiamo testo per mostrare il numero di commit
+    annotations = []
+    for i in range(pivot_data.shape[0]):
+        for j in range(pivot_data.shape[1]):
+            if pivot_data.iloc[i, j] > 0:
+                annotations.append(dict(
+                    x=j, y=i,
+                    text=str(int(pivot_data.iloc[i, j])),
+                    showarrow=False,
+                    font=dict(color='black' if pivot_data.iloc[i, j] < max_val * 0.75 else 'white', size=10)
+                ))
+
+    # Configuriamo il layout
+    weekday_labels = ['Lun', 'Mar', 'Mer', 'Gio', 'Ven', 'Sab', 'Dom']
+    week_labels = []
+    for w in range(weeks):
+        first_day = start_date + timedelta(days=w * 7)
+        week_labels.append(first_day.strftime('%d %b'))
+
+    fig.update_layout(
+        title='Mosaico commit in stile GitHub',
+        xaxis=dict(
+            title='Settimana',
+            tickmode='array',
+            tickvals=list(range(weeks)),
+            ticktext=week_labels,
+            side='top'
+        ),
+        yaxis=dict(
+            title='',
+            tickmode='array',
+            tickvals=list(range(7)),
+            ticktext=weekday_labels
+        ),
+        annotations=annotations,
+        margin=dict(l=40, r=20, t=60, b=20),
+        height=300
+    )
+
+    # Quadratini invece di rettangoli
+    fig.update_traces(
+        xgap=3,  # spazio tra i quadrati in orizzontale
+        ygap=3  # spazio tra i quadrati in verticale
+    )
+
+    return fig
+
+
 def main():
     repo_path = "/Users/riccardo/Sources/GitHub/Untitled/reLuxStorm"  # <-- Modifica questo!
 
@@ -177,7 +279,7 @@ def main():
         print(f"{row['date'].strftime('%Y-%m-%d')}: {row['commits']} commit")
 
     # Crea e salva il grafico
-    fig = create_commit_plot(commit_data)
+    fig = create_commit_mosaic(commit_data, weeks=2)
     fig.write_html("git_commits.html")  # Salva come file HTML interattivo
     #fig.write_image("git_commits.png")  # Salva come immagine PNG
 
