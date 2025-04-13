@@ -60,7 +60,7 @@ def get_git_commits(repo_path, author=None, since=None, until=None):
             # Stampa i dati recuperati per debug
             print("Dati recuperati dalla repository:")
             for _, row in date_df.iterrows():
-                print(f"{row['date'].strftime('%Y-%m-%d')}: {row['commits']} commit")
+                print(f"{row['date'].strftime('%Y-%m-%d-%h')}: {row['commits']} commit")
 
             return date_df
         else:
@@ -153,7 +153,6 @@ def create_commit_plot(commit_data, days=7):
     )
 
     return fig
-
 
 def create_commit_mosaic(commit_data, weeks=1):
     """
@@ -257,6 +256,111 @@ def create_commit_mosaic(commit_data, weeks=1):
     return fig
 
 
+def create_commit_mosaic_byHours(commit_data, hours=168):  # Default a 168 ore (7 giorni)
+    """
+    Crea un grafico a mosaico dei commit in stile GitHub con raggruppamento ogni 24 ore
+    """
+    # Definiamo il periodo da visualizzare
+    end_date = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    start_date = end_date - timedelta(hours=hours)
+
+    # Crea un dataframe con tutte le ore nel periodo
+    all_hours = pd.date_range(start=start_date, end=end_date, freq='H')
+    df = pd.DataFrame({'datetime': all_hours})
+
+    # Estraiamo la data e l'ora
+    df['date'] = df['datetime'].dt.date
+    df['hour'] = df['datetime'].dt.hour
+
+    # Calcoliamo il numero del giorno relativo all'inizio del periodo
+    df['day'] = ((df['datetime'] - start_date).dt.total_seconds() // (24 * 3600))
+
+    # Uniamo con i dati dei commit, usando 0 per le ore senza commit
+    if not commit_data.empty:
+        # Assumiamo che commit_data abbia una colonna 'datetime' o convertiamo la colonna 'date' in datetime
+        hourly_commits = commit_data.groupby(pd.Grouper(key='date', freq='H')).sum().reset_index()
+        hourly_commits['datetime'] = hourly_commits['date']
+        df = df.merge(hourly_commits[['datetime', 'commits']], on='datetime', how='left')
+    else:
+        df['commits'] = 0
+
+    df['commits'] = df['commits'].fillna(0).astype(int)
+
+    # Prepariamo i dati per il grafico a mosaico
+    pivot_data = df.pivot(index='hour', columns='day', values='commits').fillna(0)
+
+    # Definiamo i colori in stile GitHub
+    colors = ['#ebedf0', '#9be9a8', '#40c463', '#30a14e', '#216e39']
+
+    # Normalizzazione per la colorazione
+    max_val = df['commits'].max() if df['commits'].max() > 0 else 1
+
+    # Creiamo il grafico a mosaico usando heatmap
+    fig = go.Figure(data=go.Heatmap(
+        z=pivot_data.values,
+        colorscale=[
+            [0, colors[0]],
+            [0.001 if max_val > 1 else 0.25, colors[0]],  # 0 commits
+            [0.001 if max_val > 1 else 0.25, colors[1]],  # 1-25% del max
+            [0.25, colors[1]],
+            [0.25, colors[2]],  # 25-50% del max
+            [0.5, colors[2]],
+            [0.5, colors[3]],  # 50-75% del max
+            [0.75, colors[3]],
+            [0.75, colors[4]],  # 75-100% del max
+            [1.0, colors[4]]
+        ],
+        showscale=False,
+        hovertemplate='Commit: %{z}<extra></extra>'
+    ))
+
+    # Aggiungiamo testo per mostrare il numero di commit
+    annotations = []
+    for i in range(pivot_data.shape[0]):
+        for j in range(pivot_data.shape[1]):
+            if pivot_data.iloc[i, j] > 0:
+                annotations.append(dict(
+                    x=j, y=i,
+                    text=str(int(pivot_data.iloc[i, j])),
+                    showarrow=False,
+                    font=dict(color='black' if pivot_data.iloc[i, j] < max_val * 0.75 else 'white', size=10)
+                ))
+
+    # Configuriamo il layout
+    hour_labels = [f'{h}:00' for h in range(24)]
+    day_labels = []
+    for d in range(int(hours // 24) + 1):
+        current_day = start_date + timedelta(days=d)
+        day_labels.append(current_day.strftime('%d %b'))
+
+    fig.update_layout(
+        title='Mosaico commit per ora del giorno',
+        xaxis=dict(
+            title='Giorno',
+            tickmode='array',
+            tickvals=list(range(len(day_labels))),
+            ticktext=day_labels,
+            side='top'
+        ),
+        yaxis=dict(
+            title='Ora',
+            tickmode='array',
+            tickvals=list(range(24)),
+            ticktext=hour_labels
+        ),
+        annotations=annotations,
+        margin=dict(l=40, r=20, t=60, b=20),
+        height=600  # Altezza maggiore per visualizzare meglio tutte le 24 ore
+    )
+
+    # Quadratini invece di rettangoli
+    fig.update_traces(
+        xgap=3,  # spazio tra i quadrati in orizzontale
+        ygap=3  # spazio tra i quadrati in verticale
+    )
+
+    return fig
+
 def main():
     repo_path = "/Users/riccardo/Sources/GitHub/Untitled/reLuxStorm"  # <-- Modifica questo!
 
@@ -316,7 +420,7 @@ if __name__ == "__main__":
         # Convertiamo le date in oggetti datetime
         data_reali_parsed = []
         for data_str, count in data_reali:
-            data_reali_parsed.append((datetime.strptime(data_str, '%Y-%m-%d'), count))
+            data_reali_parsed.append((datetime.strptime(data_str, '%Y-%m-%d-%h'), count))
 
         # Creiamo un range di 7 giorni
         for i in range(7):
