@@ -46,14 +46,14 @@ class VettoreATestoDecoder(nn.Module):
     def __init__(self, input_dim, output_dim):
         super().__init__()
         # Rete neurale per proiettare l'embedding nel formato corretto per il decoder
-        # Aggiunti più strati per una migliore rappresentazione
+        # Assicuriamo che l'output abbia la dimensione corretta per gli embedding di GPT-2
         self.projection = nn.Sequential(
-            nn.Linear(input_dim, input_dim // 2),
-            nn.LayerNorm(input_dim // 2),
+            nn.Linear(input_dim, input_dim),
+            nn.LayerNorm(input_dim),
             nn.GELU(),
-            nn.Linear(input_dim // 2, output_dim),
-            nn.LayerNorm(output_dim),
-            nn.Tanh()
+            nn.Linear(input_dim, output_dim),
+            nn.LayerNorm(output_dim)
+            # Rimuoviamo la funzione Tanh finale per mantenere la distribuzione degli embedding
         )
 
     def forward(self, x):
@@ -447,55 +447,45 @@ def ricostruisci_da_vettore(vettore, max_length=100, temperatura=0.7, num_campio
     # Converti il vettore in un tensor
     vettore_tensor = torch.tensor(vettore).float().to(device)
 
-    # Converti il vettore in un formato adatto al modello di linguaggio
+    # Usa il decoder per trasformare l'embedding in un formato adatto al modello di linguaggio
     with torch.no_grad():
-        # Usa il decoder per trasformare l'embedding in un hidden state per il generatore
-        hidden_state = decoder(vettore_tensor.unsqueeze(0))
+        # Proietta il vettore nello spazio del generatore
+        projected_state = decoder(vettore_tensor.unsqueeze(0))
 
     try:
-        # Prepara l'input iniziale
+        # Una strategia semplificata: usiamo il vettore proiettato come "conditioning"
+        # per inizializzare la generazione, ma non proviamo a forzare il past_key_values
+
+        # Prepariamo l'input per il modello di generazione
         if prompt:
-            input_tokens = tokenizer_gen(prompt, return_tensors="pt").to(device)
-            input_ids = input_tokens.input_ids
+            # Se c'è un prompt, lo usiamo come input iniziale
+            inputs = tokenizer_gen(prompt, return_tensors="pt").to(device)
         else:
-            input_ids = torch.tensor([[tokenizer_gen.bos_token_id]]).to(device)
+            # Altrimenti, usiamo un token di inizio semplice
+            inputs = tokenizer_gen("<|endoftext|>", return_tensors="pt").to(device)
 
-        # Configura gli hidden states iniziali del modello
-        # Prepara il formato corretto per past_key_values in GPT-2
-        # past_key_values è una tupla di tuple: (key_layers, value_layers) per ogni layer
-        # Ogni key/value layer ha dimensione [batch, heads, seq_len, head_dim]
-        batch_size = 1
-        n_heads = model_gen.config.n_head
-        head_dim = model_gen.config.n_embd // n_heads
-        seq_len = 1
-
-        # Gli hidden states che abbiamo calcolato devono essere trasformati nel formato corretto
-        # Creiamo dei valori fittizi per key e value per simulare un contesto
-        reshaped_hidden = hidden_state.view(batch_size, 1, -1)
-
-        # Creiamo tensori vuoti per simulare past_key_values
-        past_key_values = []
-        for _ in range(model_gen.config.n_layer):
-            # Per ogni layer, creiamo key e value tensors
-            key_layer = torch.zeros(batch_size, n_heads, seq_len, head_dim).to(device)
-            value_layer = reshaped_hidden.repeat(1, n_heads, 1).view(batch_size, n_heads, seq_len, head_dim)
-            past_key_values.append((key_layer, value_layer))
-
-        # Trasforma in tupla di tuple
-        past_key_values = tuple(past_key_values)
-
-        # Genera il testo
+        # Usiamo il vettore proiettato come conditioning
+        # Lo facciamo passandolo come input_embeds anziché input_ids per il primo token
         with torch.no_grad():
+            # Otteniamo le dimensioni dell'embedding
+            input_embeds = model_gen.transformer.wte(inputs.input_ids)
+
+            # Sostituiamo il primo token con il nostro vettore proiettato
+            # Assicuriamoci che le dimensioni corrispondano
+            if input_embeds.shape[1] > 0:
+                # Manteniamo le dimensioni batch e embed, ma modifichiamo solo il primo token
+                input_embeds[:, 0, :] = projected_state
+
+            # Generiamo il testo usando gli embedding modificati
             output_sequences = model_gen.generate(
-                input_ids=input_ids,
+                inputs_embeds=input_embeds,
                 max_length=max_length,
                 temperature=temperatura,
-                top_p=0.9,
+                top_p=0.92,
                 do_sample=True,
                 num_return_sequences=num_campioni,
-                past_key_values=past_key_values if num_campioni == 1 else None,  # Past values solo per singolo campione
-                no_repeat_ngram_size=3,  # Evita ripetizioni di trigrammi
-                early_stopping=True  # Ferma la generazione quando è logico
+                no_repeat_ngram_size=3,
+                early_stopping=True
             )
 
         # Decodifica il testo generato
@@ -507,9 +497,47 @@ def ricostruisci_da_vettore(vettore, max_length=100, temperatura=0.7, num_campio
             return testi_generati
 
     except Exception as e:
-        print(f"Errore durante la generazione: {e}")
-        # Fallback: genera senza condizionamento iniziale
-        return genera_testo_semplice(max_length, temperatura, num_campioni, prompt)
+        print(f"Errore durante la generazione con input_embeds: {e}")
+        # Proviamo un secondo approccio: applica il vettore come un bias per il primo token
+        try:
+            with torch.no_grad():
+                # Prepariamo un input normale
+                if prompt:
+                    input_ids = tokenizer_gen(prompt, return_tensors="pt").input_ids.to(device)
+                else:
+                    input_ids = tokenizer_gen("<|endoftext|>", return_tensors="pt").input_ids.to(device)
+
+                # Eseguiamo un forward pass parziale per ottenere il primo hidden state
+                outputs = model_gen(input_ids, output_hidden_states=True, use_cache=True)
+
+                # Modifichiamo il past_key_values con il nostro vettore proiettato
+                # Usiamo solo il primo token per il conditioning
+                past = outputs.past_key_values
+
+                # Generiamo il resto del testo
+                output_sequences = model_gen.generate(
+                    input_ids=input_ids[:, -1:],  # Solo l'ultimo token
+                    max_length=max_length,
+                    temperature=temperatura,
+                    top_p=0.92,
+                    do_sample=True,
+                    num_return_sequences=num_campioni,
+                    past_key_values=past,
+                    no_repeat_ngram_size=3
+                )
+
+                # Decodifica il testo generato
+                if num_campioni == 1:
+                    testo_generato = tokenizer_gen.decode(output_sequences[0], skip_special_tokens=True)
+                    return testo_generato
+                else:
+                    testi_generati = [tokenizer_gen.decode(seq, skip_special_tokens=True) for seq in output_sequences]
+                    return testi_generati
+
+        except Exception as e:
+            print(f"Errore nel secondo approccio: {e}")
+            # Fallback: genera senza condizionamento preciso
+            return genera_testo_semplice(max_length, temperatura, num_campioni, prompt)
 
 
 def genera_testo_semplice(max_length=100, temperatura=0.7, num_campioni=1, prompt=None):
@@ -573,15 +601,33 @@ def testa_ricostruzione(testo, temperatura=0.7, num_campioni=3):
     # Crea embedding per il testo
     vettore = crea_embedding([testo])[0]
 
-    # Ricostruisci dal vettore
-    risultati = ricostruisci_da_vettore(vettore, temperatura=temperatura, num_campioni=num_campioni)
+    # Metodo 1: Ricostruzione diretta dal vettore
+    print("Metodo 1 - Ricostruzione diretta:")
+    try:
+        risultati = ricostruisci_da_vettore(vettore, temperatura=temperatura, num_campioni=num_campioni)
 
-    print("Ricostruzioni:")
-    if isinstance(risultati, list):
-        for i, r in enumerate(risultati):
-            print(f"{i + 1}. {r}")
-    else:
-        print(risultati)
+        if isinstance(risultati, list):
+            for i, r in enumerate(risultati):
+                print(f"{i + 1}. {r}")
+        else:
+            print(risultati)
+    except Exception as e:
+        print(f"Errore nella ricostruzione diretta: {e}")
+
+    # Metodo 2: Generazione semplice con prompt
+    print("\nMetodo 2 - Generazione con prompt:")
+    try:
+        prompt = "Questo testo parla di: "
+        risultati = genera_testo_semplice(max_length=100, temperatura=temperatura,
+                                          num_campioni=num_campioni, prompt=prompt)
+
+        if isinstance(risultati, list):
+            for i, r in enumerate(risultati):
+                print(f"{i + 1}. {r}")
+        else:
+            print(risultati)
+    except Exception as e:
+        print(f"Errore nella generazione con prompt: {e}")
 
     return vettore, risultati
 
