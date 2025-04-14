@@ -60,7 +60,7 @@ def get_git_commits(repo_path, author=None, since=None, until=None):
             # Stampa i dati recuperati per debug
             print("Dati recuperati dalla repository:")
             for _, row in date_df.iterrows():
-                print(f"{row['date'].strftime('%Y-%m-%d-%h')}: {row['commits']} commit")
+                print(f"{row['date'].strftime('%Y-%m-%d-%H')}: {row['commits']} commit")
 
             return date_df
         else:
@@ -76,6 +76,100 @@ def get_git_commits(repo_path, author=None, since=None, until=None):
         os.chdir(current_dir)
 
 
+def create_commit_plot_hours(commit_data, hours=168):
+    """
+    Crea un grafico dei commit per ora usando Plotly
+    """
+    # Prepara i dati per tutte le ore del periodo
+    end_date = datetime.now().replace(minute=0, second=0, microsecond=0)
+    start_date = end_date - timedelta(hours=hours - 1)
+
+    # Crea un dataframe con tutte le ore
+    all_hours = pd.date_range(start=start_date, end=end_date, freq='H')
+    df = pd.DataFrame({'datetime': all_hours})
+
+    # Aggiungi le etichette per l'asse x
+    df['hour_label'] = df['datetime'].dt.strftime('%d/%m\n%H:00')
+
+    # Aggiungi i conteggi dei commit, usando 0 per le ore senza commit
+    if not commit_data.empty:
+        # Assumiamo che commit_data abbia una colonna 'datetime' con timestamp
+        # Se invece ha solo date, dobbiamo prima convertirla in timestamp con ora
+        hourly_commits = commit_data.copy()
+        if 'datetime' not in hourly_commits.columns:
+            # Se abbiamo solo date senza ore, convertiamo al formato orario
+            hourly_commits['datetime'] = pd.to_datetime(hourly_commits['date'])
+
+        # Raggruppiamo per ora
+        hourly_commits = hourly_commits.groupby(pd.Grouper(key='datetime', freq='H')).sum().reset_index()
+
+        # Unisci con tutti i timestamp del periodo
+        df = df.merge(hourly_commits[['datetime', 'commits']], on='datetime', how='left')
+    else:
+        df['commits'] = 0
+
+    df['commits'] = df['commits'].fillna(0).astype(int)
+
+    # Definiamo i colori in stile GitHub
+    colors = ['#ebedf0', '#9be9a8', '#40c463', '#30a14e', '#216e39']
+
+    # Trova il valore massimo per la scala dei colori
+    max_val = df['commits'].max() if df['commits'].max() > 0 else 1
+
+    # Assegna colori in base al valore
+    def get_color(val):
+        if val == 0:
+            return colors[0]
+        elif val <= max_val * 0.25:
+            return colors[1]
+        elif val <= max_val * 0.5:
+            return colors[2]
+        elif val <= max_val * 0.75:
+            return colors[3]
+        else:
+            return colors[4]
+
+    # Crea un array di colori per ogni barra
+    bar_colors = [get_color(val) for val in df['commits']]
+
+    # Crea il grafico a barre
+    fig = go.Figure()
+
+    # Aggiungi barre per i commit
+    fig.add_trace(go.Bar(
+        x=df['hour_label'],
+        y=df['commits'],
+        text=df['commits'],
+        textposition='outside',
+        marker_color=bar_colors,
+        hovertemplate='Data/Ora: %{x}<br>Commit: %{y}<extra></extra>'
+    ))
+
+    # Configura il layout
+    fig.update_layout(
+        title='Commit orari',
+        yaxis_title='Numero di commit',
+        plot_bgcolor='white',
+        xaxis=dict(
+            title='',
+            showgrid=False,
+            tickangle=0,
+            # Mostriamo solo alcuni tick per non sovraffollare l'asse X
+            tickmode='array',
+            tickvals=df['hour_label'][::6].tolist()  # Mostra un tick ogni 6 ore
+        ),
+        yaxis=dict(
+            showgrid=True,
+            gridcolor='lightgray',
+            gridwidth=0.5
+        ),
+        margin=dict(l=40, r=40, t=50, b=40),
+        height=500,  # Aumentiamo l'altezza per un grafico più leggibile
+        width=max(800, hours * 5)  # Larghezza dinamica in base al numero di ore
+    )
+
+    return fig
+
 def create_commit_plot(commit_data, days=7):
     """
     Crea un grafico dei commit usando Plotly
@@ -89,7 +183,7 @@ def create_commit_plot(commit_data, days=7):
     df = pd.DataFrame({'date': all_dates})
 
     # Aggiungi le etichette per l'asse x
-    df['day_label'] = df['date'].dt.strftime('%a\n%d/%m')
+    df['day_label'] = df['date'].dt.strftime('%a\n%d/%m-%H')
 
     # Aggiungi i conteggi dei commit, usando 0 per i giorni senza commit
     if not commit_data.empty:
@@ -256,7 +350,7 @@ def create_commit_mosaic(commit_data, weeks=1):
     return fig
 
 
-def create_commit_mosaic_byHours(commit_data, hours=168):  # Default a 168 ore (7 giorni)
+def create_commit_mosaic_byHours(commit_data, hours=336):  # Default a 168 ore (7 giorni)
     """
     Crea un grafico a mosaico dei commit in stile GitHub con raggruppamento ogni 24 ore
     """
@@ -380,10 +474,12 @@ def main():
     top_days = commit_data.sort_values('commits', ascending=False).head(5)
     print("\nGiorni con più commit:")
     for _, row in top_days.iterrows():
-        print(f"{row['date'].strftime('%Y-%m-%d')}: {row['commits']} commit")
+        print(f"{row['date'].strftime('%Y-%m-%d-%H')}: {row['commits']} commit")
 
     # Crea e salva il grafico
-    fig = create_commit_mosaic(commit_data, weeks=2)
+    #fig = create_commit_mosaic(commit_data, weeks=2)
+    fig = create_commit_mosaic_byHours(commit_data)
+
     fig.write_html("git_commits.html")  # Salva come file HTML interattivo
     #fig.write_image("git_commits.png")  # Salva come immagine PNG
 
